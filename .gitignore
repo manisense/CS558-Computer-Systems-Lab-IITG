@@ -1,1 +1,9 @@
 .vscode/
+.DS_Store
+*.exe
+*.out
+*.log
+*.log.*
+*.log.*.*
+*.log.*.*.*
+*.log.*.*.*.*
