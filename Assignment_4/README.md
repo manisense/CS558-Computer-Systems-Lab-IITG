@@ -1,6 +1,6 @@
 # Video Streaming Simulation
 
-This project implements a video streaming simulation using TCP, UDP, and multithreading as part of the CS558 socket programming assignment.
+This project implements a simulation of a video streaming service using both TCP and UDP protocols. The application consists of a Server and a Client that communicate in two distinct phases: Connection Phase and Video Streaming Phase.
 
 ## Overview
 
@@ -17,13 +17,13 @@ The application simulates video streaming over both TCP and UDP protocols, allow
 
 ## Requirements
 
+- Unix/Linux/macOS operating system
 - GCC compiler
-- POSIX-compliant operating system (Linux, macOS, etc.)
-- pthread library
+- pthread library (usually included with the system)
 
 ## Compilation
 
-Use the provided Makefile to compile both server and client programs:
+To compile both the server and client programs, run:
 
 ```bash
 make
@@ -31,47 +31,81 @@ make
 
 This will create two executable files:
 - `server` - The video streaming server
-- `client` - The client application for receiving video streams
+- `client` - The video streaming client
 
-To clean the compiled files:
+## Running the Application
+
+### Server
+
+The server must be started first with the following command:
+
+```bash
+./server <Server Port> <Scheduling Policy: FCFS/RR>
+```
+
+- `<Server Port>`: The port number the server will listen on (e.g., 8080)
+- `<Scheduling Policy>`: Either FCFS (First-Come-First-Serve) or RR (Round-Robin)
+
+Example:
+```bash
+./server 8080 FCFS
+```
+
+### Client
+
+Once the server is running, you can start one or more clients with the following command:
+
+```bash
+./client <Server IP> <Server Port> <Mode: TCP/UDP> <Resolution: 480p/720p/1080p>
+```
+
+- `<Server IP>`: The IP address of the server (e.g., 127.0.0.1 for localhost)
+- `<Server Port>`: The port number the server is listening on
+- `<Mode>`: Either TCP or UDP (case-insensitive)
+- `<Resolution>`: Video resolution, one of: 480p, 720p, or 1080p
+
+Examples:
+```bash
+./client 127.0.0.1 8080 TCP 720p
+./client 127.0.0.1 8080 UDP 1080p
+```
+
+## How It Works
+
+### Connection Phase
+
+1. The client initiates a TCP connection with the server
+2. The client sends a Type 1 Request Message specifying the desired video resolution
+3. The server responds with a Type 2 Response Message including information about the video stream and bandwidth requirements
+4. The TCP connection for the connection phase is closed
+
+### Video Streaming Phase
+
+1. Depending on the client's chosen mode (TCP or UDP), a new connection is established
+2. For TCP Mode: Video data is transmitted over a reliable TCP connection, ensuring zero packet loss
+3. For UDP Mode: Data is sent via a UDP connection, emulating real-time streaming where packet loss may occur
+4. The server handles multiple clients based on the selected scheduling policy:
+   - FCFS: Clients are served in the order they arrive
+   - RR: Clients are served in a cyclic manner, ensuring fairness
+
+## Statistics
+
+During the streaming, both client and server collect statistics:
+
+- Client displays statistics every 10 chunks received, including data rate and packet loss (in UDP mode)
+- Server displays statistics for all clients when terminated with Ctrl+C
+
+## Cleaning Up
+
+To remove the compiled executables:
 
 ```bash
 make clean
 ```
 
-## Running the Application
+## Notes for macOS Users
 
-### Starting the Server
-
-Start the server first:
-
-```bash
-./server
-```
-
-The server will start listening for TCP connections on port 8080 and UDP connections on port 8081.
-
-### Running the TCP Client
-
-Open a new terminal and run:
-
-```bash
-./client 127.0.0.1 tcp
-```
-
-Replace `127.0.0.1` with the server's IP address if running on a different machine.
-
-### Running the UDP Client
-
-Open another terminal and run:
-
-```bash
-./client 127.0.0.1 udp
-```
-
-### Viewing Server Statistics
-
-To view the streaming statistics on the server side, press `Ctrl+C` in the server terminal. This will display statistics for all connected clients before the server exits.
+This implementation has been tested and works correctly on macOS, including the M2 chip architecture.
 
 ## Comparison of TCP and UDP
 
