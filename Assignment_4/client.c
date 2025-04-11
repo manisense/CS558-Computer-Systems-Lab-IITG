@@ -9,7 +9,10 @@
 #include <sys/time.h>
 #include <stdbool.h>
 
-#define BUFFER_SIZE 2048
+// Match server's configuration
+#define TCP_CHUNK_SIZE 131072  // 128KB for TCP
+#define UDP_CHUNK_SIZE 8192    // 8KB for UDP
+#define BUFFER_SIZE TCP_CHUNK_SIZE  // Use the larger size for our buffer
 
 // Request and Response Types
 #define TYPE_1_REQUEST 1  // Client request message
@@ -372,21 +375,29 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
     stream_tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &stream_tv, sizeof(stream_tv));
     
-    // Statistics variables
+    // Start receiving video
+    char video_chunk[UDP_CHUNK_SIZE] = {0};
     double start_time = get_time();
-    double last_time = start_time;
-    unsigned long total_bytes = 0;
+    double last_stats_time = start_time;
     int chunks_received = 0;
-    double last_data_rate = 0;
+    unsigned long total_data = 0;
+    unsigned long recent_data = 0;
     int lost_packets = 0;
-    int last_chunk_id = -1;
+    int expected_chunk_id = 0;
     
-    // Receive video stream
     while (1) {
-        memset(buffer, 0, BUFFER_SIZE);
+        memset(video_chunk, 0, UDP_CHUNK_SIZE);
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
         socklen_t server_addr_len = sizeof(serv_addr);
-        int bytes_received = recvfrom(sock, buffer, BUFFER_SIZE, 0, 
-                                     (struct sockaddr *)&serv_addr, &server_addr_len);
+        
+        // Set socket timeout
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        
+        // Receive video chunk
+        int bytes_received = recvfrom(sock, video_chunk, UDP_CHUNK_SIZE, 0, 
+                                      (struct sockaddr *)&serv_addr, &server_addr_len);
         
         if (bytes_received <= 0) {
             printf("\nTimeout or end of stream\n");
@@ -394,43 +405,43 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
         }
         
         // Update statistics
-        total_bytes += bytes_received;
+        total_data += bytes_received;
         chunks_received++;
         double current_time = get_time();
         double elapsed = current_time - start_time;
-        double interval = current_time - last_time;
+        double interval = current_time - last_stats_time;
         
         // Check for lost packets
         int chunk_id;
-        sscanf(buffer, "VIDEO_CHUNK_%d_", &chunk_id);
+        sscanf(video_chunk, "VIDEO_CHUNK_%d_", &chunk_id);
         
-        if (last_chunk_id != -1 && chunk_id != last_chunk_id + 1) {
-            lost_packets += (chunk_id - last_chunk_id - 1);
+        if (expected_chunk_id != -1 && chunk_id != expected_chunk_id) {
+            lost_packets += (chunk_id - expected_chunk_id - 1);
             printf("\nPacket loss detected! Expected %d, got %d\n", 
-                   last_chunk_id + 1, chunk_id);
+                   expected_chunk_id + 1, chunk_id);
         }
-        last_chunk_id = chunk_id;
+        expected_chunk_id = chunk_id;
         
         // Print statistics every 10 chunks
         if (chunks_received % 10 == 0) {
-            double overall_data_rate = total_bytes / elapsed;
+            double overall_data_rate = total_data / elapsed;
             if (interval > 0) {
-                last_data_rate = (bytes_received * 10) / interval;
+                recent_data = (bytes_received * 10) / interval;
             }
             
             printf("\n----- UDP Streaming Statistics -----\n");
             printf("Resolution: %s (Bandwidth: %d Kbps)\n", resolution, bandwidth);
             printf("Chunks received: %d\n", chunks_received);
-            printf("Total data received: %lu bytes\n", total_bytes);
+            printf("Total data received: %lu bytes\n", total_data);
             printf("Elapsed time: %.2f seconds\n", elapsed);
             printf("Overall data rate: %.2f bytes/sec\n", overall_data_rate);
-            printf("Recent data rate: %.2f bytes/sec\n", last_data_rate);
+            printf("Recent data rate: %lu bytes/sec\n", recent_data);
             printf("Lost packets: %d\n", lost_packets);
             printf("Packet loss rate: %.2f%%\n", 
                    (lost_packets * 100.0) / (chunks_received + lost_packets));
             printf("------------------------------------\n");
             
-            last_time = current_time;
+            last_stats_time = current_time;
         }
         
         // Simulate video processing

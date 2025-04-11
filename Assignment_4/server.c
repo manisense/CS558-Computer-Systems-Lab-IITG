@@ -10,10 +10,15 @@
 #include <sys/time.h>
 #include <signal.h>
 #include <ctype.h>
+#include <errno.h>
+#include <time.h>
+#include <stdbool.h>
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 #define MAX_CLIENTS 10
-#define VIDEO_CHUNK_SIZE 1024
+#define TCP_CHUNK_SIZE 131072  // 128KB for TCP
+#define UDP_CHUNK_SIZE 8192    // 8KB for UDP to avoid "message too long" error
+#define VIDEO_CHUNK_SIZE TCP_CHUNK_SIZE  // Default for backward compatibility
 #define VIDEO_CHUNKS 100
 
 // Request and Response Types
@@ -158,11 +163,21 @@ int estimate_bandwidth(const char *resolution) {
 void generate_video_chunk(char *buffer, int chunk_id, const char *resolution) {
     // In a real application, this would read actual video data
     // For simulation, we'll just fill the buffer with identifiable data
-    sprintf(buffer, "VIDEO_CHUNK_%d_%s_", chunk_id, resolution);
-    // Fill the rest with random data to simulate video payload
-    for (int i = strlen(buffer); i < VIDEO_CHUNK_SIZE - 1; i++) {
-        buffer[i] = 'A' + (rand() % 26);
+    int header_len = snprintf(buffer, 100, "VIDEO_CHUNK_%d_%s_", chunk_id, resolution);
+    
+    // Simulate encoding time
+    usleep(50000); // 50ms of "encoding time"
+    
+    // Fill the rest with repeating pattern to simulate video payload
+    // Safer alternative to random data for large chunks
+    char pattern[10] = "VIDEODATA";
+    for (int i = header_len; i < VIDEO_CHUNK_SIZE - 2; i += 9) {
+        int space_left = VIDEO_CHUNK_SIZE - i - 1;
+        int copy_size = (space_left < 9) ? space_left : 9;
+        memcpy(buffer + i, pattern, copy_size);
     }
+    
+    // Ensure null termination
     buffer[VIDEO_CHUNK_SIZE - 1] = '\0';
 }
 
@@ -514,19 +529,40 @@ void *handle_tcp_streaming(void *arg) {
             break;
         }
         
-        char video_chunk[VIDEO_CHUNK_SIZE];
+        // Allocate video chunk on heap instead of stack
+        char *video_chunk = (char *)malloc(VIDEO_CHUNK_SIZE);
+        if (video_chunk == NULL) {
+            printf("Failed to allocate memory for video chunk for client %d\n", client_id);
+            break;
+        }
+        
         generate_video_chunk(video_chunk, i, resolution);
         
         int bytes_sent = send(client_socket, video_chunk, VIDEO_CHUNK_SIZE, 0);
         if (bytes_sent <= 0) {
-            printf("Failed to send chunk to TCP client %d\n", client_id);
-            break;
+            printf("Failed to send chunk to TCP client %d (chunk %d/%d) - client may have disconnected. Error: %s\n", 
+                   client_id, i, VIDEO_CHUNKS, strerror(errno));
+            
+            // Don't immediately break - try once more with a small delay
+            usleep(500000); // 500ms wait before retry
+            
+            // Try one more time
+            bytes_sent = send(client_socket, video_chunk, VIDEO_CHUNK_SIZE, 0);
+            if (bytes_sent <= 0) {
+                printf("Retry failed for TCP client %d - marking client as finished\n", client_id);
+                free(video_chunk); // Free memory before breaking
+                break; // If retry fails, then break
+            } else {
+                printf("Retry succeeded for TCP client %d\n", client_id);
+            }
         }
         
         update_stats(client_id, bytes_sent, "TCP");
+        free(video_chunk); // Free the allocated memory
         
-        // Add a small delay to simulate video streaming
-        usleep(100000);  // 100ms
+        // Add a longer delay to simulate real video streaming with larger chunks
+        printf("Sent chunk %d/%d to TCP client %d\n", i+1, VIDEO_CHUNKS, client_id);
+        usleep(500000);  // 500ms delay between chunks
     }
     
     printf("Finished streaming to TCP client %d\n", client_id);
@@ -640,20 +676,66 @@ void *handle_udp_streaming(void *arg) {
             break;
         }
         
-        char video_chunk[VIDEO_CHUNK_SIZE];
-        generate_video_chunk(video_chunk, i, resolution);
-        
-        int bytes_sent = sendto(udp_socket, video_chunk, VIDEO_CHUNK_SIZE, 0, 
-                              (struct sockaddr*)&client_addr, client_addr_len);
-        if (bytes_sent <= 0) {
-            printf("Failed to send chunk to UDP client %d\n", client_id);
+        // Allocate video chunk on heap instead of stack
+        // Use UDP_CHUNK_SIZE for UDP to avoid "message too long" errors
+        char *video_chunk = (char *)malloc(UDP_CHUNK_SIZE);
+        if (video_chunk == NULL) {
+            printf("Failed to allocate memory for video chunk for client %d\n", client_id);
             break;
         }
         
-        update_stats(client_id, bytes_sent, "UDP");
+        // Generate smaller chunk for UDP
+        int header_len = snprintf(video_chunk, 100, "VIDEO_CHUNK_%d_%s_", i, resolution);
         
-        // Add a small delay to simulate video streaming
-        usleep(100000);  // 100ms
+        // Fill the rest with a repeating pattern
+        char pattern[10] = "UDPDATA";
+        for (int j = header_len; j < UDP_CHUNK_SIZE - 2; j += 7) {
+            int space_left = UDP_CHUNK_SIZE - j - 1;
+            int copy_size = (space_left < 7) ? space_left : 7;
+            memcpy(video_chunk + j, pattern, copy_size);
+        }
+        video_chunk[UDP_CHUNK_SIZE - 1] = '\0';
+        
+        int bytes_sent = sendto(udp_socket, video_chunk, UDP_CHUNK_SIZE, 0, 
+                              (struct sockaddr*)&client_addr, client_addr_len);
+        if (bytes_sent <= 0) {
+            printf("Failed to send chunk to UDP client %d (chunk %d/%d) - Error: %s\n", 
+                   client_id, i, VIDEO_CHUNKS, strerror(errno));
+            
+            // For UDP, try a few more times before giving up
+            int retry_count = 0;
+            const int max_retries = 3;
+            
+            while (retry_count < max_retries && bytes_sent <= 0) {
+                usleep(200000); // 200ms wait before retry
+                
+                bytes_sent = sendto(udp_socket, video_chunk, UDP_CHUNK_SIZE, 0, 
+                                  (struct sockaddr*)&client_addr, client_addr_len);
+                
+                if (bytes_sent > 0) {
+                    printf("Retry succeeded for UDP client %d after %d attempts\n", 
+                           client_id, retry_count + 1);
+                    break;
+                }
+                
+                retry_count++;
+                printf("Retry %d/%d failed for UDP client %d\n", 
+                       retry_count, max_retries, client_id);
+            }
+            
+            if (bytes_sent <= 0) {
+                printf("Giving up after %d retries for UDP client %d\n", max_retries, client_id);
+                free(video_chunk); // Free memory before breaking
+                break;
+            }
+        }
+        
+        update_stats(client_id, bytes_sent, "UDP");
+        free(video_chunk); // Free the allocated memory
+        
+        // Add a longer delay to simulate real video streaming with larger chunks
+        printf("Sent chunk %d/%d to UDP client %d\n", i+1, VIDEO_CHUNKS, client_id);
+        usleep(500000);  // 500ms delay between chunks
     }
     
     printf("Finished streaming to UDP client %d\n", client_id);
@@ -666,7 +748,7 @@ void *handle_udp_streaming(void *arg) {
     return NULL;
 }
 
-// Handle the scheduler thread for all clients - implements both FCFS and RR
+// Handle the scheduler thread for all clients
 void *scheduler_thread(void *arg) {
     // Silence the unused parameter warning
     (void)arg;
@@ -676,17 +758,38 @@ void *scheduler_thread(void *arg) {
     
     while (1) {
         int client_id;
+        bool client_found = false;
         
         if (scheduling_policy == POLICY_FCFS) {
             // First-Come-First-Serve scheduling
-            client_id = dequeue_client();
+            pthread_mutex_lock(&queue_mutex);
+            if (queue_head != NULL) {
+                // Get client from queue without waiting
+                QueueNode *temp = queue_head;
+                client_id = temp->client_id;
+                queue_head = queue_head->next;
+                
+                if (queue_head == NULL) {
+                    queue_tail = NULL;
+                }
+                
+                free(temp);
+                client_found = true;
+                printf("Scheduler: Dequeued client %d for processing\n", client_id);
+            }
+            pthread_mutex_unlock(&queue_mutex);
+            
+            if (!client_found) {
+                // No clients waiting, sleep briefly and try again
+                usleep(50000); // 50ms
+                continue;
+            }
         } else {
             // Round-Robin scheduling
             pthread_mutex_lock(&stats_mutex);
             
             // Find the next active client in a round-robin fashion
             int start_id = current_rr_client;
-            int found = 0;
             
             // Only consider clients in IDLE state and active
             do {
@@ -695,28 +798,38 @@ void *scheduler_thread(void *arg) {
                 if (client_count > 0 && 
                     client_stats[current_rr_client].state == STATE_IDLE && 
                     client_stats[current_rr_client].active) {
-                    found = 1;
+                    client_id = current_rr_client;
+                    client_found = true;
                     break;
                 }
             } while (current_rr_client != start_id && client_count > 0);
             
-            if (found) {
-                client_id = current_rr_client;
+            if (client_found) {
                 // Mark as no longer IDLE to prevent repeated attempts
                 client_stats[client_id].state = STATE_CONNECTION;
-            } else {
-                // If no idle client is found, wait for new clients
-                pthread_mutex_unlock(&stats_mutex);
-                sleep(1);
-                continue;
+                printf("Scheduler: Selected client %d (RR mode)\n", client_id);
             }
             
             pthread_mutex_unlock(&stats_mutex);
+            
+            if (!client_found) {
+                // If no idle client is found, wait for new clients
+                usleep(50000); // 50ms
+                continue;
+            }
         }
         
         // Get the protocol from client stats
         char protocol[10];
         pthread_mutex_lock(&stats_mutex);
+        
+        // Double-check client is still valid
+        if (client_id >= client_count || !client_stats[client_id].active) {
+            pthread_mutex_unlock(&stats_mutex);
+            printf("Scheduler: Client %d is no longer valid or active\n", client_id);
+            continue;
+        }
+        
         strncpy(protocol, client_stats[client_id].protocol, sizeof(protocol));
         pthread_mutex_unlock(&stats_mutex);
         
@@ -730,10 +843,20 @@ void *scheduler_thread(void *arg) {
         *client_arg = client_id;
         
         if (strcasecmp(protocol, "TCP") == 0) {
-            pthread_create(&thread_id, NULL, handle_tcp_streaming, client_arg);
+            printf("Scheduler: Starting TCP streaming thread for client %d\n", client_id);
+            if (pthread_create(&thread_id, NULL, handle_tcp_streaming, client_arg) != 0) {
+                perror("Failed to create TCP streaming thread");
+                free(client_arg);
+                continue;
+            }
             pthread_detach(thread_id);
         } else if (strcasecmp(protocol, "UDP") == 0) {
-            pthread_create(&thread_id, NULL, handle_udp_streaming, client_arg);
+            printf("Scheduler: Starting UDP streaming thread for client %d\n", client_id);
+            if (pthread_create(&thread_id, NULL, handle_udp_streaming, client_arg) != 0) {
+                perror("Failed to create UDP streaming thread");
+                free(client_arg);
+                continue;
+            }
             pthread_detach(thread_id);
         } else {
             printf("Unknown protocol for client %d: %s\n", client_id, protocol);
@@ -746,20 +869,8 @@ void *scheduler_thread(void *arg) {
             pthread_mutex_unlock(&stats_mutex);
         }
         
-        // If using FCFS, wait for this client to finish before serving the next one
-        if (scheduling_policy == POLICY_FCFS) {
-            pthread_mutex_lock(&stats_mutex);
-            while (client_stats[client_id].state != STATE_FINISHED && 
-                   client_stats[client_id].active) {
-                pthread_mutex_unlock(&stats_mutex);
-                sleep(1);
-                pthread_mutex_lock(&stats_mutex);
-            }
-            pthread_mutex_unlock(&stats_mutex);
-        } else {
-            // For RR, add a small delay to avoid rapid successive attempts
-            usleep(500000); // 500ms
-        }
+        // Small delay to prevent CPU hogging, but don't wait for stream to complete
+        usleep(10000); // 10ms delay
     }
     
     return NULL;
@@ -781,6 +892,10 @@ void signal_handler(int sig) {
         fflush(stdout);
         
         exit(0);
+    } else if (sig == SIGPIPE) {
+        // Ignore SIGPIPE signals which happen when writing to a closed socket
+        // This prevents the server from terminating when a client disconnects unexpectedly
+        printf("Caught SIGPIPE (client likely disconnected) - ignoring\n");
     }
 }
 
@@ -811,8 +926,12 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     
-    // Setup signal handler for CTRL+C
+    // Setup signal handlers
     signal(SIGINT, signal_handler);
+    signal(SIGPIPE, signal_handler);  // Handle SIGPIPE to prevent server crash when clients disconnect
+
+    // Initialize random seed for port generation
+    srand(time(NULL));
     
     // Initialize client statistics
     for (int i = 0; i < MAX_CLIENTS; i++) {
