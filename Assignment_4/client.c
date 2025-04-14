@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <stdbool.h>
+#include <errno.h>
 
 // Match server's configuration
 #define TCP_CHUNK_SIZE 131072  // 128KB for TCP
@@ -29,6 +30,7 @@ typedef struct {
     int bandwidth;          // Estimated bandwidth in Kbps (set by server)
     char protocol[10];      // Protocol (TCP or UDP)
     int streaming_port;     // Port for streaming (assigned by server)
+    int client_id;          // Client ID assigned by the server
 } Message;
 
 // Get current time in seconds
@@ -96,97 +98,29 @@ int connection_phase(const char *server_ip, int server_port, const char *resolut
         exit(EXIT_FAILURE);
     }
     
-    // Extract streaming port assigned by server
+    // Extract streaming port and client_id assigned by server
     *streaming_port = response.streaming_port;
     
-    printf("Received Type 2 Response - Selected resolution: %s, Bandwidth requirement: %d Kbps, Streaming port: %d\n", 
-           response.resolution, response.bandwidth, *streaming_port);
+    printf("Received Type 2 Response - Selected resolution: %s, Bandwidth requirement: %d Kbps, Streaming port: %d, Client ID: %d\n", 
+           response.resolution, response.bandwidth, *streaming_port, response.client_id);
     
     // Close the connection phase socket
     close(sock);
     
-    return response.bandwidth;
+    return response.client_id;
 }
 
 // TCP client implementation for video streaming
 void tcp_client(const char *server_ip, int server_port, const char *resolution) {
     int streaming_port = server_port; // Default value
-    int bandwidth = connection_phase(server_ip, server_port, resolution, "TCP", &streaming_port);
+    int client_id = connection_phase(server_ip, server_port, resolution, "TCP", &streaming_port);
+    int bandwidth = 1500; // Default value, will be set by the server
     
-    // For TCP, we need to wait for the streaming port to be assigned
-    if (streaming_port == 0) {
-        int retry_count = 0;
-        int max_retries = 5; // Maximum number of retries
-        
-        printf("Waiting for TCP streaming port assignment...\n");
-        sleep(1); // Give the server a moment to set up
-        
-        while (retry_count < max_retries) {
-            // Create a polling socket for port discovery
-            int poll_sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (poll_sock < 0) {
-                perror("TCP polling socket creation failed");
-                exit(EXIT_FAILURE);
-            }
-            
-            struct sockaddr_in poll_addr;
-            memset(&poll_addr, 0, sizeof(poll_addr));
-            poll_addr.sin_family = AF_INET;
-            poll_addr.sin_port = htons(server_port);
-            
-            if (inet_pton(AF_INET, server_ip, &poll_addr.sin_addr) <= 0) {
-                perror("Invalid address for polling");
-                close(poll_sock);
-                exit(EXIT_FAILURE);
-            }
-            
-            // Connect to server
-            if (connect(poll_sock, (struct sockaddr *)&poll_addr, sizeof(poll_addr)) < 0) {
-                perror("TCP polling connection failed");
-                close(poll_sock);
-                retry_count++;
-                sleep(1);
-                continue;
-            }
-            
-            // Request the streaming port
-            if (send(poll_sock, "GET_STREAM_PORT", strlen("GET_STREAM_PORT"), 0) < 0) {
-                perror("Failed to request stream port");
-                close(poll_sock);
-                retry_count++;
-                sleep(1);
-                continue;
-            }
-            
-            // Wait for server to respond with port number
-            char port_buffer[32] = {0};
-            if (recv(poll_sock, port_buffer, sizeof(port_buffer), 0) <= 0) {
-                printf("Retry %d/%d: No port response yet\n", retry_count + 1, max_retries);
-                close(poll_sock);
-                retry_count++;
-                sleep(1);
-                continue;
-            }
-            
-            // Extract port from response
-            if (sscanf(port_buffer, "PORT:%d", &streaming_port) == 1 && streaming_port > 0) {
-                printf("Received dynamic TCP streaming port: %d\n", streaming_port);
-                close(poll_sock);
-                break;
-            } else {
-                printf("Retry %d/%d: Invalid port response: %s\n", retry_count + 1, max_retries, port_buffer);
-                close(poll_sock);
-                retry_count++;
-                sleep(1);
-                continue;
-            }
-        }
-        
-        if (streaming_port <= 0) {
-            printf("Failed to get streaming port after %d attempts\n", max_retries);
-            exit(EXIT_FAILURE);
-        }
-    }
+    // The server now uses the same port as specified in the Type 2 Response
+    // streaming_port = server_port + 1;  // Remove this hardcoded value
+    streaming_port = server_port + 1; // Hardcode to server_port+1 for TCP streaming
+    
+    printf("Using TCP streaming port: %d with client ID: %d\n", streaming_port, client_id);
     
     int sock = 0;
     struct sockaddr_in serv_addr;
@@ -209,21 +143,19 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     
     printf("Connecting to TCP streaming server at %s:%d...\n", server_ip, streaming_port);
     
-    // Add a longer delay to allow server time to set up streaming socket
-    printf("Waiting for server to be ready (2 seconds)...\n");
-    sleep(2); // 2 seconds
-    
-    // Connect to server with retries
+    // Connect to server with retries and better error handling
     int connected = 0;
     int retry_count = 0;
-    int max_retries = 10;
+    int max_retries = 15;  // Increased from 10 to 15
     
     while (!connected && retry_count < max_retries) {
         if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
             connected = 1;
+            printf("Successfully connected to TCP streaming server on attempt %d\n", retry_count + 1);
         } else {
             retry_count++;
-            printf("Connection attempt %d failed, retrying in 1 second...\n", retry_count);
+            printf("Connection attempt %d failed: %s, retrying in 1 second...\n", 
+                   retry_count, strerror(errno));
             sleep(1);
         }
     }
@@ -235,17 +167,53 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     
     printf("Connected to TCP server at %s:%d for video streaming\n", server_ip, streaming_port);
     
-    // Wait for server to be ready
-    int bytes_received = recv(sock, buffer, BUFFER_SIZE, 0);
-    if (bytes_received <= 0 || strcmp(buffer, "READY_TO_STREAM") != 0) {
-        printf("Server not ready to stream\n");
+    // Send client_id that was assigned by the server
+    char id_buffer[32];
+    snprintf(id_buffer, sizeof(id_buffer), "%d", client_id);
+    
+    printf("Sending client ID: %s\n", id_buffer);
+    if (send(sock, id_buffer, strlen(id_buffer), 0) < 0) {
+        perror("Failed to send client ID");
         close(sock);
         exit(EXIT_FAILURE);
     }
     
-    // Send confirmation to start streaming
-    send(sock, "START_STREAM", strlen("START_STREAM"), 0);
+    // Wait for server to be ready with timeout
+    struct timeval tv;
+    tv.tv_sec = 15;  // Increased timeout to 15 seconds
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
+    // Wait for server to be ready
+    printf("Waiting for server READY_TO_STREAM message (timeout: %d seconds)...\n", (int)tv.tv_sec);
+    int bytes_received = recv(sock, buffer, BUFFER_SIZE, 0);
+    
+    if (bytes_received <= 0) {
+        printf("Server not ready to stream (timeout after %d seconds)\n", (int)tv.tv_sec);
+        printf("Error: %s\n", strerror(errno));
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("Received message from server: '%s'\n", buffer);
+    
+    if (strcmp(buffer, "READY_TO_STREAM") != 0) {
+        printf("Server sent unexpected message: '%s' instead of 'READY_TO_STREAM'\n", buffer);
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("Received READY_TO_STREAM from server\n");
+    
+    // Send confirmation to start streaming
+    printf("Sending START_STREAM confirmation to server\n");
+    if (send(sock, "START_STREAM", strlen("START_STREAM"), 0) < 0) {
+        perror("Failed to send START_STREAM confirmation");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("Sent START_STREAM confirmation to server\n");
     printf("Starting video stream reception (TCP, %s)...\n", resolution);
     
     // Statistics variables
@@ -305,7 +273,8 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
 // UDP client implementation for video streaming
 void udp_client(const char *server_ip, int server_port, const char *resolution) {
     int streaming_port = server_port; // Default value
-    int bandwidth = connection_phase(server_ip, server_port, resolution, "UDP", &streaming_port);
+    int client_id = connection_phase(server_ip, server_port, resolution, "UDP", &streaming_port);
+    int bandwidth = 6000; // Default value, will be set by the server
     
     int sock = 0;
     struct sockaddr_in serv_addr;
@@ -327,37 +296,49 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
         exit(EXIT_FAILURE);
     }
     
-    printf("Requesting video stream from UDP server at %s:%d\n", server_ip, streaming_port);
+    printf("Requesting video stream from UDP server at %s:%d (Client ID: %d)\n", 
+           server_ip, streaming_port, client_id);
     
-    // Add a longer delay to allow server time to set up streaming socket
-    printf("Waiting for server to be ready (2 seconds)...\n");
-    sleep(2); // 2 seconds
-    
-    // Send request to start streaming - retry up to 3 times
+    // Send request to start streaming - retry up to 5 times (increased from 3)
     int retry_count = 0;
-    int max_retries = 3;
+    int max_retries = 5;
     bool received_ready = false;
     
     while (retry_count < max_retries && !received_ready) {
         // Send request
-        sendto(sock, "REQUEST_STREAM", strlen("REQUEST_STREAM"), 0, 
-               (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+        if (sendto(sock, "REQUEST_STREAM", strlen("REQUEST_STREAM"), 0, 
+               (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            perror("Failed to send UDP request");
+            retry_count++;
+            sleep(1);
+            continue;
+        }
+        
+        printf("Sent REQUEST_STREAM to server (attempt %d/%d)\n", retry_count + 1, max_retries);
         
         // Wait for server to be ready with a timeout
         struct timeval tv;
-        tv.tv_sec = 2;  // 2 seconds timeout for initial response
+        tv.tv_sec = 3;  // 3 seconds timeout for initial response
         tv.tv_usec = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         
         socklen_t server_addr_len = sizeof(serv_addr);
+        memset(buffer, 0, BUFFER_SIZE);
         int bytes_received = recvfrom(sock, buffer, BUFFER_SIZE, 0, 
                                      (struct sockaddr *)&serv_addr, &server_addr_len);
         
-        if (bytes_received > 0 && strcmp(buffer, "READY_TO_STREAM") == 0) {
-            received_ready = true;
+        if (bytes_received > 0) {
+            if (strcmp(buffer, "READY_TO_STREAM") == 0) {
+                received_ready = true;
+                printf("Received READY_TO_STREAM response from server\n");
+            } else {
+                printf("Received unexpected response: '%s'\n", buffer);
+                retry_count++;
+            }
         } else {
+            printf("Retry %d/%d: No response from server. Error: %s\n", 
+                   retry_count + 1, max_retries, strerror(errno));
             retry_count++;
-            printf("Retry %d/%d: Waiting for server response...\n", retry_count, max_retries);
         }
     }
     

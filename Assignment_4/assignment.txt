@@ -1,0 +1,66 @@
+Application #2: Video Streaming Simulation using
+TCP, UDP, and Multithreading
+In this assignment, you are required to implement a simulation of a video streaming
+service using both TCP and UDP protocols. The objective is to analyze how each protocol
+handles video data under different network conditions and compare their performance.
+The application consists of a Server and a Client. The communication between the
+two involves two distinct phases. In the Connection Phase, the client initiates a TCP
+connection with the server to request video streaming. During this phase, the client sends
+a Type 1 Request Message that specifies the desired video resolution (for example, 480p,
+720p, or 1080p). The server responds with a Type 2 Response Message that includes
+information about the selected video stream and its estimated bandwidth requirements.
+Once this exchange is complete, the TCP connection is closed.
+
+The next phase is the Video Streaming Phase, where the client chooses whether
+to stream the video using TCP or UDP. If the client selects TCP Mode, the video
+data is transmitted over a new reliable TCP connection, ensuring zero packet loss. If
+UDP Mode is chosen, the data is sent via a UDP connection, emulating real-time video
+streaming where packet loss may occur. The server must be capable of handling multiple
+client connections concurrently, for which a multithreaded implementation is required.
+To manage client requests efficiently, the server supports two scheduling policies. The
+First-Come-First-Serve (FCFS) policy serves clients in the order they arrive, while
+the Round-Robin (RR) policy ensures fairness by streaming video to clients in a cyclic
+manner. These policies help simulate different strategies of load balancing and resource
+allocation in a real streaming environment.
+
+Performance Measurement
+This simulation includes detailed performance analysis. Throughput and latency will be
+measured for both TCP and UDP modes under varying video resolutions (480p, 720p,
+and 1080p). For UDP, the simulation will introduce packet loss to study its impact on
+video quality. Resource utilization in terms of CPU and memory consumption will also
+be monitored and compared for both protocols. The following table outlines the key
+metrics:
+Metric Description
+Throughput Amount of video data transmitted per second (Mbps)
+Latency Time delay between request and first packet received (ms)
+Packet Loss (UDP) Percentage of packets lost during transmission
+CPU Usage Percentage of CPU consumed during streaming
+Memory Usage Amount of RAM used during streaming
+Table 1: Performance Metrics for Evaluation
+The collected results will be visualized using appropriate graphs, such as Throughput
+vs. Resolution and Latency vs. Resolution, to highlight the differences in protocol
+performance under various conditions.
+
+Command Line Interface
+The simulation must support the following command-line interface for both the client
+and server programs:
+• Client: <executable code> <Server IP> <Server Port> <Mode: TCP/UDP> <Resolution:
+480p/720p/1080p>
+• Server: <executable code> <Server Port> <Scheduling Policy: FCFS/RR>
+
+
+
+Additional Notes
+
+
+
+The implementation must include proper error handling and socket management. Packet
+loss, network latency, and bandwidth limitations should be simulated programmatically
+to reflect real-world networking conditions. Since this is a simulation, actual video files
+are not required—instead, mock data should be used to represent the video stream for
+simplicity and to reduce resource usage.
+The server should be capable of supporting concurrent clients through multithreading,
+and the client should be able to switch between TCP and UDP streaming modes easily.
+Code should be well-documented with clear comments to support future modifications or
+enhancements.
+
