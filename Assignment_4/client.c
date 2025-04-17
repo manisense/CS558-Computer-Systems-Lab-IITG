@@ -1,14 +1,43 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/time.h>
+#include <time.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <inttypes.h>
+
+// Platform-specific includes and definitions
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    // #pragma comment(lib, "ws2_32.lib")
+    typedef int socklen_t;
+    #define strcasecmp _stricmp
+    #define sleep(x) Sleep(x*1000)
+    #define usleep(x) Sleep(x/1000)
+    typedef SOCKET socket_t;
+    #define INVALID_SOCKET_VALUE INVALID_SOCKET
+    #define CLOSE_SOCKET(s) closesocket(s)
+    #define GET_LAST_ERROR() WSAGetLastError()
+#else
+    #include <unistd.h>
+    #include <sys/types.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <sys/time.h>
+    typedef int socket_t;
+    #define INVALID_SOCKET_VALUE -1
+    #define CLOSE_SOCKET(s) close(s)
+    #define GET_LAST_ERROR() errno
+#endif
+
+// Add socket format printing helpers for Windows - function declarations
+#ifdef _WIN32
+void print_socket_info(const char* prefix, socket_t socket_val);
+#else
+void print_socket_info(const char* prefix, socket_t socket_val);
+#endif
 
 // Match server's configuration
 #define TCP_CHUNK_SIZE 131072  // 128KB for TCP
@@ -35,20 +64,74 @@ typedef struct {
 
 // Get current time in seconds
 double get_time() {
+#ifdef _WIN32
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec + tv.tv_usec / 1000000.0;
+#endif
+}
+
+// Platform-independent socket error handling
+void print_socket_error(const char* message) {
+#ifdef _WIN32
+    int error_code = WSAGetLastError();
+    char error_message[256];
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                 NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                 error_message, sizeof(error_message), NULL);
+    fprintf(stderr, "%s: %s (Error code: %d)\n", message, error_message, error_code);
+#else
+    perror(message);
+#endif
+}
+
+// Socket info printing helpers
+#ifdef _WIN32
+void print_socket_info(const char* prefix, socket_t socket_val) {
+    printf("%s%" PRIu64 "\n", prefix, (uint64_t)socket_val);
+}
+#else
+void print_socket_info(const char* prefix, socket_t socket_val) {
+    printf("%s%d\n", prefix, socket_val);
+}
+#endif
+
+// Initialize the socket system (required for Windows)
+int initialize_socket_system() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        printf("WSAStartup failed: %d\n", result);
+        return 0;
+    }
+    return 1;
+#else
+    return 1; // No initialization needed for Unix/Linux
+#endif
+}
+
+// Cleanup socket system (required for Windows)
+void cleanup_socket_system() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }
 
 // Send Type 1 Request and receive Type 2 Response using TCP
 int connection_phase(const char *server_ip, int server_port, const char *resolution, const char *protocol, int *streaming_port) {
-    int sock = 0;
+    socket_t sock = INVALID_SOCKET_VALUE;
     struct sockaddr_in serv_addr;
     Message request, response;
     
     // Create TCP socket for connection phase
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("TCP socket creation failed");
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET_VALUE) {
+        print_socket_error("TCP socket creation failed");
         exit(EXIT_FAILURE);
     }
     
@@ -57,13 +140,15 @@ int connection_phase(const char *server_ip, int server_port, const char *resolut
     
     // Convert IP address from text to binary form
     if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        perror("Invalid address or address not supported");
+        print_socket_error("Invalid address or address not supported");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
     // Connect to server
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("TCP connection failed");
+        print_socket_error("TCP connection failed");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -76,25 +161,25 @@ int connection_phase(const char *server_ip, int server_port, const char *resolut
     request.bandwidth = 0; // Client doesn't set bandwidth
     
     // Send Type 1 Request
-    if (send(sock, &request, sizeof(request), 0) < 0) {
-        perror("Failed to send request message");
-        close(sock);
+    if (send(sock, (char*)&request, sizeof(request), 0) < 0) {
+        print_socket_error("Failed to send request message");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
     printf("Sent Type 1 Request with resolution: %s and protocol: %s\n", resolution, protocol);
     
     // Receive Type 2 Response
-    ssize_t bytes_received = recv(sock, &response, sizeof(response), 0);
+    int bytes_received = recv(sock, (char*)&response, sizeof(response), 0);
     if (bytes_received <= 0) {
-        perror("Failed to receive response from server");
-        close(sock);
+        print_socket_error("Failed to receive response from server");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
     if (response.type != TYPE_2_RESPONSE) {
         printf("Received invalid response type\n");
-        close(sock);
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -105,7 +190,7 @@ int connection_phase(const char *server_ip, int server_port, const char *resolut
            response.resolution, response.bandwidth, *streaming_port, response.client_id);
     
     // Close the connection phase socket
-    close(sock);
+    CLOSE_SOCKET(sock);
     
     return response.client_id;
 }
@@ -122,13 +207,13 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     
     printf("Using TCP streaming port: %d with client ID: %d\n", streaming_port, client_id);
     
-    int sock = 0;
+    socket_t sock = INVALID_SOCKET_VALUE;
     struct sockaddr_in serv_addr;
     char buffer[BUFFER_SIZE] = {0};
     
     // Create socket for video streaming
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("TCP socket creation failed");
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET_VALUE) {
+        print_socket_error("TCP socket creation failed");
         exit(EXIT_FAILURE);
     }
     
@@ -137,7 +222,8 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     
     // Convert IP address from text to binary form
     if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        perror("Invalid address or address not supported");
+        print_socket_error("Invalid address or address not supported");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -154,18 +240,22 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
             printf("Successfully connected to TCP streaming server on attempt %d\n", retry_count + 1);
         } else {
             retry_count++;
-            printf("Connection attempt %d failed: %s, retrying in 1 second...\n", 
-                   retry_count, strerror(errno));
+            print_socket_error("Connection attempt failed");
+            printf("Connection attempt %d failed, retrying in 1 second...\n", retry_count);
             sleep(1);
         }
     }
     
     if (!connected) {
-        perror("TCP connection failed after multiple attempts");
+        print_socket_error("TCP connection failed after multiple attempts");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
     printf("Connected to TCP server at %s:%d for video streaming\n", server_ip, streaming_port);
+    
+    // Print socket info using our platform-safe function
+    print_socket_info("Using socket: ", sock);
     
     // Send client_id that was assigned by the server
     char id_buffer[32];
@@ -173,25 +263,30 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     
     printf("Sending client ID: %s\n", id_buffer);
     if (send(sock, id_buffer, strlen(id_buffer), 0) < 0) {
-        perror("Failed to send client ID");
-        close(sock);
+        print_socket_error("Failed to send client ID");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
     // Wait for server to be ready with timeout
+#ifdef _WIN32
+    DWORD timeout = 15000;  // 15 seconds in milliseconds
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
     struct timeval tv;
     tv.tv_sec = 15;  // Increased timeout to 15 seconds
     tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
     
     // Wait for server to be ready
-    printf("Waiting for server READY_TO_STREAM message (timeout: %d seconds)...\n", (int)tv.tv_sec);
+    printf("Waiting for server READY_TO_STREAM message (timeout: 15 seconds)...\n");
     int bytes_received = recv(sock, buffer, BUFFER_SIZE, 0);
     
     if (bytes_received <= 0) {
-        printf("Server not ready to stream (timeout after %d seconds)\n", (int)tv.tv_sec);
-        printf("Error: %s\n", strerror(errno));
-        close(sock);
+        printf("Server not ready to stream (timeout after 15 seconds)\n");
+        print_socket_error("Error");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -199,7 +294,7 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     
     if (strcmp(buffer, "READY_TO_STREAM") != 0) {
         printf("Server sent unexpected message: '%s' instead of 'READY_TO_STREAM'\n", buffer);
-        close(sock);
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -208,8 +303,8 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     // Send confirmation to start streaming
     printf("Sending START_STREAM confirmation to server\n");
     if (send(sock, "START_STREAM", strlen("START_STREAM"), 0) < 0) {
-        perror("Failed to send START_STREAM confirmation");
-        close(sock);
+        print_socket_error("Failed to send START_STREAM confirmation");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -267,7 +362,7 @@ void tcp_client(const char *server_ip, int server_port, const char *resolution) 
     }
     
     printf("\nStream ended after receiving %d chunks\n", chunks_received);
-    close(sock);
+    CLOSE_SOCKET(sock);
 }
 
 // UDP client implementation for video streaming
@@ -276,13 +371,13 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
     int client_id = connection_phase(server_ip, server_port, resolution, "UDP", &streaming_port);
     int bandwidth = 6000; // Default value, will be set by the server
     
-    int sock = 0;
+    socket_t sock = INVALID_SOCKET_VALUE;
     struct sockaddr_in serv_addr;
     char buffer[BUFFER_SIZE] = {0};
     
     // Create socket
-    if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("UDP socket creation failed");
+    if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_VALUE) {
+        print_socket_error("UDP socket creation failed");
         exit(EXIT_FAILURE);
     }
     
@@ -292,7 +387,8 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
     
     // Convert IP address from text to binary form
     if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        perror("Invalid address or address not supported");
+        print_socket_error("Invalid address or address not supported");
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
@@ -308,7 +404,7 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
         // Send request
         if (sendto(sock, "REQUEST_STREAM", strlen("REQUEST_STREAM"), 0, 
                (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-            perror("Failed to send UDP request");
+            print_socket_error("Failed to send UDP request");
             retry_count++;
             sleep(1);
             continue;
@@ -317,10 +413,15 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
         printf("Sent REQUEST_STREAM to server (attempt %d/%d)\n", retry_count + 1, max_retries);
         
         // Wait for server to be ready with a timeout
+#ifdef _WIN32
+        DWORD timeout = 3000;  // 3 seconds in milliseconds
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
         struct timeval tv;
         tv.tv_sec = 3;  // 3 seconds timeout for initial response
         tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
         
         socklen_t server_addr_len = sizeof(serv_addr);
         memset(buffer, 0, BUFFER_SIZE);
@@ -336,25 +437,30 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
                 retry_count++;
             }
         } else {
-            printf("Retry %d/%d: No response from server. Error: %s\n", 
-                   retry_count + 1, max_retries, strerror(errno));
+            print_socket_error("No response from server");
+            printf("Retry %d/%d: No response from server\n", retry_count + 1, max_retries);
             retry_count++;
         }
     }
     
     if (!received_ready) {
         printf("Server not ready to stream after %d attempts\n", max_retries);
-        close(sock);
+        CLOSE_SOCKET(sock);
         exit(EXIT_FAILURE);
     }
     
     printf("Starting video stream reception (UDP, %s)...\n", resolution);
     
     // Set longer timeout for video streaming
+#ifdef _WIN32
+    DWORD stream_timeout = 5000;  // 5 seconds in milliseconds
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&stream_timeout, sizeof(stream_timeout));
+#else
     struct timeval stream_tv;
     stream_tv.tv_sec = 5;  // 5 seconds timeout
     stream_tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &stream_tv, sizeof(stream_tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&stream_tv, sizeof(stream_tv));
+#endif
     
     // Start receiving video
     char video_chunk[UDP_CHUNK_SIZE] = {0};
@@ -368,13 +474,18 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
     
     while (1) {
         memset(video_chunk, 0, UDP_CHUNK_SIZE);
+        
+#ifdef _WIN32
+        DWORD timeout = 5000;  // 5 seconds in milliseconds
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
         struct timeval timeout;
         timeout.tv_sec = 5;
         timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#endif
+
         socklen_t server_addr_len = sizeof(serv_addr);
-        
-        // Set socket timeout
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         
         // Receive video chunk
         int bytes_received = recvfrom(sock, video_chunk, UDP_CHUNK_SIZE, 0, 
@@ -431,12 +542,18 @@ void udp_client(const char *server_ip, int server_port, const char *resolution) 
     }
     
     printf("\nStream ended after receiving %d chunks\n", chunks_received);
-    close(sock);
+    CLOSE_SOCKET(sock);
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 5) {
         printf("Usage: %s <Server IP> <Server Port> <Resolution: 480p/720p/1080p> <Mode: TCP/UDP>\n", argv[0]);
+        return -1;
+    }
+    
+    // Initialize socket system (needed for Windows)
+    if (!initialize_socket_system()) {
+        printf("Failed to initialize socket system\n");
         return -1;
     }
     
@@ -450,6 +567,7 @@ int main(int argc, char *argv[]) {
         strcmp(resolution, "720p") != 0 && 
         strcmp(resolution, "1080p") != 0) {
         printf("Invalid resolution. Use '480p', '720p', or '1080p'.\n");
+        cleanup_socket_system();
         return -1;
     }
     
@@ -460,8 +578,12 @@ int main(int argc, char *argv[]) {
         udp_client(server_ip, server_port, resolution);
     } else {
         printf("Invalid mode. Use 'TCP' or 'UDP'.\n");
+        cleanup_socket_system();
         return -1;
     }
+    
+    // Clean up socket system
+    cleanup_socket_system();
     
     return 0;
 } 
